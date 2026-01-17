@@ -1,0 +1,29 @@
+#!/usr/bin/bash
+
+TMPDIR=$(mktemp -d /tmp/webhook.homepage.XXXXXXXXXX) || exit 1
+pushd "$TMPDIR" || exit 1
+git clone https://github.com/derdilla/blood-pressure-monitor-fl.git || exit  1
+
+docker run --rm -v "$TMPDIR/blood-pressure-monitor-fl:/repo" -v "$TMPDIR/output:/output" antonmedv/gitmal \
+    -e GIT_CONFIG_COUNT=1 \
+    -e GIT_CONFIG_KEY_0=safe.directory \
+    -e GIT_CONFIG_VALUE_0=/repo \
+    --minify \
+    --output "/output" \
+    --name "Blood Pressure Monitor" \
+    --owner derdillla \
+    --theme fruity \
+    --default-branch main \
+    "/repo"
+pushd "$TMPDIR/output" || exit 1
+find . -type f -regextype posix-extended -regex '.*\.(htm|html|css|js|xml|xsl|txt|woff|woff2|svg|otf|eot|ttf)' \
+    -exec gzip --best -k -f {} \
+    \+ -exec brotli --best -f {} \;
+popd || exit 2;
+
+# install
+rm -r /www/git.derdilla.com/bpapp
+cp -r public /www/git.derdilla.com/bpapp
+
+# cleanup
+rm -r "$TMPDIR"
