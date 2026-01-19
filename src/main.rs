@@ -1,14 +1,17 @@
 use axum::{
-    Router,
-    routing::post,
-    extract::{Path, State},
     body::Bytes,
-    http::{StatusCode, HeaderMap},
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Router,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::os::unix::prelude::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
+use landlock::{RulesetCreated, RulesetError};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -19,12 +22,16 @@ struct AppConfig {
     port: String,
 }
 
+const ENV_WEBHOOK_SECRET: &str = "WEBHOOK_SECRET";
+const ENV_HOOKS_DIR: &str = "HOOKS_DIR";
+const ENV_PORT: &str = "PORT";
+
 impl AppConfig {
     fn from_env() -> Self {
-        let webhook_secret = std::env::var("WEBHOOK_SECRET")
+        let webhook_secret = std::env::var(ENV_WEBHOOK_SECRET)
             .expect("WEBHOOK_SECRET environment variable must be set");
 
-        let hooks_dir = std::env::var("HOOKS_DIR")
+        let hooks_dir = std::env::var(ENV_HOOKS_DIR)
             .unwrap_or_else(|_| "./hooks".to_string());
         let hooks_dir = PathBuf::from(hooks_dir)
             .canonicalize().expect("Unable to canonicalize hooks dir");
@@ -32,7 +39,7 @@ impl AppConfig {
             panic!("Hooks dir does not exist or is not a directory");
         }
 
-        let port = std::env::var("PORT")
+        let port = std::env::var(ENV_PORT)
             .unwrap_or_else(|_| "3000".to_string());
 
         Self {
@@ -87,7 +94,7 @@ async fn webhook_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Get signature from header
+    // Get signature from the header
     let signature = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
@@ -98,11 +105,14 @@ async fn webhook_handler(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Check if hook script exists
+    // Check if the hook script exists
     let hook_path = config.hooks_dir
         .join(&project)
-        .canonicalize()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .canonicalize();
+
+    println!("Checking {:?}, {:?}", hook_path, config.hooks_dir
+        .join(&project));
+    let hook_path = hook_path.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Second path traversal sanity check
     if !hook_path.starts_with(&config.hooks_dir) {
@@ -113,25 +123,69 @@ async fn webhook_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Execute hook script with security restrictions
-    execute_hook(&hook_path).await?;
+    // Execute the hook script in a non-blocking fashion with sandboxing
+    execute_hook(hook_path)?;
 
     Ok(StatusCode::OK)
 }
 
-async fn execute_hook(script_path: &PathBuf) -> Result<(), StatusCode> {
-    println!("Executing '{:?}'", script_path);
-    // TODO: sandbox hooks and only copy output
-    let output = tokio::process::Command::new(script_path)
-        .output()
-        .await
+fn execute_hook(script_path: PathBuf) -> Result<(), StatusCode> {
+    println!("Executing '{:?}'", &script_path);
+
+    let workdir = tempfile::tempdir()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if !output.status.success() {
-        eprintln!("Hook failed: {:?}", output);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut command = Command::new(script_path);
+    let command = (&mut command)
+        .env_remove(ENV_WEBHOOK_SECRET)
+        .env_remove(ENV_HOOKS_DIR)
+        .env_remove(ENV_PORT)
+        .env("TMPDIR", &workdir.path());
+
+    // Only allow write to workdir_path and static pages
+    let allowed_path = PathBuf::from(workdir.path());
+
+    // SAFETY: pre_exec runs in the child process after fork() but before exec().
+    // Out code is fine there since we only call standard Linux system calls to
+    // configure permissions so the process can do less unexpected things.
+    unsafe {
+        command.pre_exec(move || {
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+            let ruleset = create_ruleset(allowed_path.clone())
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            if let Ok(ruleset) = ruleset {
+                if !ruleset.restrict_self().is_ok() {
+                    eprintln!("Restriction check failed");
+                }
+            } else {
+                eprintln!("Failed to create ruleset");
+            };
+
+            Ok(())
+        });
     }
 
+    let mut proc = command
+        .spawn()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    tokio::task::spawn(async move {
+        _ = proc.wait();
+        workdir.close().unwrap();
+    });
+
     Ok(())
+}
+
+fn create_ruleset(workdir: PathBuf) -> Result<RulesetCreated, RulesetError> {
+    use landlock::{path_beneath_rules, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
+
+    let abi = ABI::V6;
+    Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))?
+        .create()?
+        .add_rules(path_beneath_rules(&["/"], AccessFs::from_read(abi)))?
+        .add_rules(path_beneath_rules(&["/www"], AccessFs::from_all(abi)))?
+        .add_rules(path_beneath_rules(&[workdir], AccessFs::from_all(abi)))
 }
 

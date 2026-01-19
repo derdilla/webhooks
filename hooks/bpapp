@@ -1,13 +1,18 @@
 #!/usr/bin/bash
 
-TMPDIR=$(mktemp -d /tmp/webhook.homepage.XXXXXXXXXX) || exit 1
+if [ -z "$TMPDIR" ]; then
+  echo "TMPDIR not set or blank"
+  exit 1
+fi
+
 pushd "$TMPDIR" || exit 1
 git clone https://github.com/derdilla/blood-pressure-monitor-fl.git || exit  1
 
-docker run --rm -v "$TMPDIR/blood-pressure-monitor-fl:/repo" -v "$TMPDIR/output:/output" antonmedv/gitmal \
+docker run --rm -v "$TMPDIR/blood-pressure-monitor-fl:/repo" -v "$TMPDIR/output:/output" \
     -e GIT_CONFIG_COUNT=1 \
     -e GIT_CONFIG_KEY_0=safe.directory \
     -e GIT_CONFIG_VALUE_0=/repo \
+    antonmedv/gitmal \
     --minify \
     --output "/output" \
     --name "Blood Pressure Monitor" \
@@ -19,11 +24,10 @@ pushd "$TMPDIR/output" || exit 1
 find . -type f -regextype posix-extended -regex '.*\.(htm|html|css|js|xml|xsl|txt|woff|woff2|svg|otf|eot|ttf)' \
     -exec gzip --best -k -f {} \
     \+ -exec brotli --best -f {} \;
-popd || exit 2;
 
 # install
-rm -r /www/git.derdilla.com/bpapp
-cp -r public /www/git.derdilla.com/bpapp
+rm -r /www/git.derdilla.com/bpapp/*
+cp -r ./* /www/git.derdilla.com/bpapp/
+popd || exit 2
 
-# cleanup
-rm -r "$TMPDIR"
+# cleanup done by caller

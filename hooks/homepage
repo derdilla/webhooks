@@ -1,14 +1,18 @@
 #!/usr/bin/bash
 
+if [ -z "$TMPDIR" ]; then
+  echo "TMPDIR not set or blank"
+  exit 1
+fi
+
 # download
-TMPDIR=$(mktemp -d /tmp/webhook.homepage.XXXXXXXXXX) || exit 1
 pushd "$TMPDIR" || exit 1
 curl -fLO https://github.com/derdilla/personal-website/archive/refs/heads/main.zip
 unzip main.zip
 
 # building
 pushd personal-website-main/ || exit 1
-docker run -u 0:0 -v /srv/derdilla.com/personal-website-main:/app --workdir /app ghcr.io/getzola/zola:v0.20.0 build || exit
+docker run -u 0:0 -v .:/app --workdir /app ghcr.io/getzola/zola:v0.20.0 build || exit
 
 pushd public || exit 1
 find . -type f -regextype posix-extended -regex '.*\.(htm|html|css|js|xml|xsl|txt|woff|woff2|svg|otf|eot|ttf)' \
@@ -19,5 +23,4 @@ popd || exit 2
 # install
 cp -r public/* /www/derdilla.com/
 
-# cleanup
-rm -rf "$TMPDIR"
+# cleanup done by caller
